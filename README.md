@@ -58,4 +58,4 @@ A working session logs `endframe prologue hooked` or `endframe tail hooked`, the
 
 ## Version
 
-The source in this tree is 4.6.0. On top of 4.5.0 it draws the Windows mouse cursor over the pause, admin, wardrobe, and context-menu pages, which do not include a cursor in the captured frame.
+First public release of the Open77 VR HUD bridge.

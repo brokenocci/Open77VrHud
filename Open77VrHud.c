@@ -195,6 +195,7 @@ static ID3D11DeviceContext* g_ctx;
 static ID3D11VertexShader* g_vs;
 static ID3D11PixelShader* g_ps;
 static ID3D11PixelShader* g_ps_lin;
+static ID3D11PixelShader* g_ps_cursor;
 static ID3D11BlendState* g_bs;
 static ID3D11SamplerState* g_ss;
 static ID3D11RasterizerState* g_rs;
@@ -724,6 +725,13 @@ static const char* kShader =
     "  float3 hi = pow((c.rgb + 0.055) / 1.055, 2.4);\n"
     "  c.rgb = (c.rgb <= 0.04045) ? lo : hi;\n"
     "  return c;\n"
+    "}\n"
+    "float4 ps_cursor(V i) : SV_Target {\n"
+    "  float2 p = i.uv;\n"
+    "  float inside = (p.x > 0.10 && p.y > 0.10 && p.x + p.y < 0.86) ? 1.0 : 0.0;\n"
+    "  float shape = (p.x + p.y < 1.02) ? 1.0 : 0.0;\n"
+    "  if (shape < 0.5) discard;\n"
+    "  return inside > 0.5 ? float4(1, 1, 1, 1) : float4(0, 0, 0, 1);\n"
     "}\n";
 
 typedef HRESULT(WINAPI* CompileFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3D10Blob**, ID3D10Blob**);
@@ -745,13 +753,14 @@ static void release_d3d11(void) {
     if (g_vs) ID3D11VertexShader_Release(g_vs);
     if (g_ps) ID3D11PixelShader_Release(g_ps);
     if (g_ps_lin) ID3D11PixelShader_Release(g_ps_lin);
+    if (g_ps_cursor) ID3D11PixelShader_Release(g_ps_cursor);
     if (g_bs) ID3D11BlendState_Release(g_bs);
     if (g_ss) ID3D11SamplerState_Release(g_ss);
     if (g_rs) ID3D11RasterizerState_Release(g_rs);
     if (g_ctx) ID3D11DeviceContext_Release(g_ctx);
     if (g_dev1) ID3D11Device1_Release(g_dev1);
     if (g_dev) ID3D11Device_Release(g_dev);
-    g_vs = NULL; g_ps = NULL; g_ps_lin = NULL; g_bs = NULL; g_ss = NULL; g_rs = NULL; g_ctx = NULL; g_dev1 = NULL; g_dev = NULL;
+    g_vs = NULL; g_ps = NULL; g_ps_lin = NULL; g_ps_cursor = NULL; g_bs = NULL; g_ss = NULL; g_rs = NULL; g_ctx = NULL; g_dev1 = NULL; g_dev = NULL;
 }
 
 static int init_d3d11(ID3D11Device* dev) {
@@ -763,7 +772,7 @@ static int init_d3d11(ID3D11Device* dev) {
     D3D11_RASTERIZER_DESC rd;
     void* multi = NULL;
     int i;
-    if (g_dev == dev && g_vs && g_ps && g_ps_lin && g_bs) return 1;
+    if (g_dev == dev && g_vs && g_ps && g_ps_lin && g_ps_cursor && g_bs) return 1;
     release_d3d11();
     /* Slots already opened, and the sampling resources, belong to another device. */
     EnterCriticalSection(&g_lock);
@@ -810,6 +819,10 @@ static int init_d3d11(ID3D11Device* dev) {
     if (!b) return 0;
     ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &g_ps_lin);
     ID3D10Blob_Release(b);
+    b = compile(fn, "ps_cursor", "ps_5_0");
+    if (!b) return 0;
+    ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &g_ps_cursor);
+    ID3D10Blob_Release(b);
     memset(&bd, 0, sizeof(bd));
     bd.RenderTarget[0].BlendEnable = TRUE;
     bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -830,8 +843,8 @@ static int init_d3d11(ID3D11Device* dev) {
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = TRUE;
     ID3D11Device_CreateRasterizerState(dev, &rd, &g_rs);
-    if (!g_vs || !g_ps || !g_ps_lin || !g_bs || !g_ss || !g_rs || !g_ctx) {
-        hud_log("d3d11 objects failed vs %d ps %d lin %d bs %d ss %d rs %d ctx %d dev1 %d", g_vs != NULL, g_ps != NULL, g_ps_lin != NULL, g_bs != NULL, g_ss != NULL, g_rs != NULL, g_ctx != NULL, g_dev1 != NULL);
+    if (!g_vs || !g_ps || !g_ps_lin || !g_ps_cursor || !g_bs || !g_ss || !g_rs || !g_ctx) {
+        hud_log("d3d11 objects failed vs %d ps %d lin %d cursor %d bs %d ss %d rs %d ctx %d dev1 %d", g_vs != NULL, g_ps != NULL, g_ps_lin != NULL, g_ps_cursor != NULL, g_bs != NULL, g_ss != NULL, g_rs != NULL, g_ctx != NULL, g_dev1 != NULL);
         return 0;
     }
     hud_log("d3d11 ready on device %p (dev1 %d)", (void*)dev, g_dev1 != NULL);
@@ -1331,12 +1344,42 @@ static void restore_state(Saved* s) {
     if (s->dss) ID3D11DepthStencilState_Release(s->dss);
 }
 
+/* These pages are driven by the Windows cursor, which CEF does not bake into
+   the captured frame. The arrow is drawn on top, in the same place. */
+static int wants_cursor(const char* name) {
+    return strcmp(name, "open77_pause") == 0 || strcmp(name, "open77_admin") == 0
+        || strcmp(name, "open77_wardrobe_ui") == 0 || strcmp(name, "open77_contextmenu") == 0;
+}
+
+static int cursor_on_page(const int* board, D3D11_VIEWPORT* out) {
+    POINT pt;
+    RECT rc;
+    HWND hwnd;
+    float u, v, size;
+    if (!GetCursorPos(&pt)) return 0;
+    hwnd = GetForegroundWindow();
+    if (!hwnd || !ScreenToClient(hwnd, &pt) || !GetClientRect(hwnd, &rc)) return 0;
+    if (rc.right <= 0 || rc.bottom <= 0) return 0;
+    if (pt.x < 0 || pt.y < 0 || pt.x >= rc.right || pt.y >= rc.bottom) return 0;
+    u = (float)pt.x / (float)rc.right;
+    v = (float)pt.y / (float)rc.bottom;
+    size = (float)board[3] * 0.045f;
+    if (size < 18.f) size = 18.f;
+    out->TopLeftX = (FLOAT)board[0] + u * (FLOAT)board[2];
+    out->TopLeftY = (FLOAT)board[1] + v * (FLOAT)board[3];
+    out->Width = size;
+    out->Height = size;
+    out->MinDepth = 0.f;
+    out->MaxDepth = 1.f;
+    return 1;
+}
+
 /* Draw the pages into the current swapchain buffer and commit it. */
 static int render_hud(const int* board_vp) {
     Saved s;
     D3D11_VIEWPORT vp;
     FLOAT clear[4] = {0, 0, 0, 0};
-    int idx = 0, i, o, drawn = 0, avail = 0, rc, tint, sel;
+    int idx = 0, i, o, drawn = 0, avail = 0, rc, tint, sel, cursor = 0;
     int order[RING_MAX];
     ID3D11RenderTargetView* rtv;
     if (ovr_index(g_sess, g_chain, &idx) < 0 || idx < 0 || idx >= g_chain_len) idx = 0;
@@ -1388,6 +1431,15 @@ static int render_hud(const int* board_vp) {
                 ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &r->s[k].srv);
                 ID3D11DeviceContext_Draw(g_ctx, 3, 0);
                 drawn++;
+                if (wants_cursor(r->name) && (!r->s[k].sig_valid || r->s[k].alpha > 64)) cursor = 1;
+            }
+        }
+        if (cursor && g_ps_cursor) {
+            D3D11_VIEWPORT cv;
+            if (cursor_on_page(board_vp, &cv)) {
+                ID3D11DeviceContext_RSSetViewports(g_ctx, 1, &cv);
+                ID3D11DeviceContext_PSSetShader(g_ctx, g_ps_cursor, NULL, 0);
+                ID3D11DeviceContext_Draw(g_ctx, 3, 0);
             }
         }
         {
@@ -1733,7 +1785,7 @@ static BOOL CALLBACK start_once(PINIT_ONCE once, PVOID param, PVOID* ctx) {
             wcsncat(g_logs_dir, L"\\logs", MAX_PATH - wcslen(g_logs_dir) - 1);
         } else g_logs_dir[0] = 0;
     }
-    hud_log("Open77 VR HUD 4.5.0 bridge (tint %d dump %d select %s formats %s sampleRings %d staticHideMs %d followLog %d hide [%s])",
+    hud_log("Open77 VR HUD 4.6.0 bridge (tint %d dump %d select %s formats %s sampleRings %d staticHideMs %d followLog %d hide [%s])",
             g_tint, g_dump, g_select_newest ? "newest" : "all", g_only_bgra ? "bgra" : "all", g_sample_rings, g_static_hide_ms,
             g_follow_log, g_hide_list);
     if (g_enabled) CreateThread(NULL, 0, worker, NULL, 0, NULL);
@@ -1749,7 +1801,7 @@ __declspec(dllexport) void Query(PluginInfo* info) {
     info->name = L"Open77 VR HUD";
     info->author = L"local";
     info->version.major = 4;
-    info->version.minor = 5;
+    info->version.minor = 6;
     info->version.patch = 0;
     info->runtime = -1;
 }

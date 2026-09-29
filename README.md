@@ -49,7 +49,7 @@ Connect the headset in Virtual Desktop before launching the game. Join a server 
 [Zig](https://ziglang.org/) 0.14.1:
 
 ```
-zig cc -shared -O2 -target x86_64-windows-gnu -o Open77VrHud.dll Open77VrHud.c -ld3d12 -ld3d11 -ldxgi -lole32 -luuid -lpsapi
+zig cc -shared -O2 -target x86_64-windows-gnu -o Open77VrHud.dll Open77VrHud.c -ld3d12 -ld3d11 -ldxgi -lole32 -luuid -luser32 -lpsapi
 ```
 
 Or run `build.ps1` on Windows.
@@ -62,4 +62,4 @@ A working session logs `endframe prologue hooked` or `endframe tail hooked`, the
 
 ## Version
 
-The source in this tree is 4.5.0. A development machine may be running a separately built 4.6.0 DLL; that build's source is not in this tree.
+The source in this tree is 4.6.0. On top of 4.5.0 it draws the Windows mouse cursor over the pause, admin, wardrobe, and context-menu pages, which do not include a cursor in the captured frame.

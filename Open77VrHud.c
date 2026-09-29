@@ -1,21 +1,22 @@
 /*
- * Open77 VR HUD 4.1.0 - bridge LibOVR per REAL VR + Virtual Desktop.
+ * Open77 VR HUD — LibOVR bridge for R.E.A.L. VR and Virtual Desktop.
  *
- * Come funziona (basato su quanto misurato nei log, non su teoria):
- *  - REAL VR 26.3 in modalita' Auto parla con LibOVR (VirtualDesktop.LibOVRRT64_1.dll)
- *    e a ogni frame chiama ovr_EndFrame con 2 layer: type 1 (occhi) e type 3 (board HUD).
- *  - L'header dei layer LibOVR moderno e' Type+Flags+Reserved[128] = 136 byte: la
- *    texture del quad sta a +136, non a +8 (errore di tutte le build 3.x).
- *  - Open77 apre le pagine WebUI (CEF, shared NT handle, ring 3 slot per surface)
- *    sul device D3D12 del gioco: le intercettiamo in ID3D12Device::OpenSharedHandle,
- *    duplichiamo l'handle e le riapriamo in D3D11 sul device che REAL VR usa per LibOVR.
- *  - A ogni ovr_EndFrame componiamo le pagine in una nostra swapchain LibOVR e
- *    aggiungiamo un terzo layer quad con la stessa posa della board di REAL VR.
+ * Measured on Cyberpunk 2077 2.31, R.E.A.L. VR 26.3, Quest 3:
+ *  - R.E.A.L. submits through LibOVR. Each ovr_EndFrame carries two layers:
+ *    type 1 (eyes) and type 3 (the HUD board).
+ *  - A current LibOVR layer header is Type + Flags + Reserved[128] = 136 bytes.
+ *    The quad texture pointer is at +136. Offset +8 is the legacy layout and is
+ *    empty on this runtime.
+ *  - Open77 imports each WebUI page as three shared D3D12 textures. Those
+ *    handles are reopened on the D3D11 device R.E.A.L. uses for LibOVR.
+ *  - The pages are composited into our own LibOVR swapchain and submitted as
+ *    a third quad layer that copies the board pose.
  *
- * Hook usati (tutti gia' entrati senza crash nelle sessioni precedenti):
- *  - vtable ID3D12Device slot 32 (OpenSharedHandle)
- *  - prologo ovr_CreateTextureSwapChainDX (cattura session + device D3D11)
- *  - jmp di coda in ovr_EndFrame (+38)
+ * Hooks:
+ *  - ID3D12Device vtable slot 32 (OpenSharedHandle)
+ *  - ovr_CreateTextureSwapChainDX prologue (session and D3D11 device)
+ *  - ovr_EndFrame: tail jump on the Virtual Desktop build, prologue on the
+ *    Meta Horizon build
  */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
@@ -48,12 +49,12 @@ static const GUID kMulti11 = {0x9b7e4e00, 0x342c, 0x4106, {0xa1, 0x9f, 0x4f, 0x2
 #define LAYER_MAX 16
 #define VP_MAX 16
 
-/* Open77 importa ogni superficie WebUI come un ring di 3 texture condivise
-   ("ring revision 1 imported: 3 slots"), tutte dallo stesso thread in pochi ms.
-   CEF scrive i frame a rotazione negli slot: gli slot vecchi conservano frame
-   superati, quindi va disegnato solo lo slot scritto per ultimo. */
+/* Open77 imports each WebUI surface as a ring of 3 shared textures
+   ("ring revision 1 imported: 3 slots"), all from the same thread within a
+   few milliseconds. CEF rotates frames across the slots, so older slots keep
+   stale frames. Only the most recently written slot is drawn. */
 typedef struct {
-    ID3D12Resource* res;              /* nostro riferimento: rileva quando Open77 lo rilascia */
+    ID3D12Resource* res;              /* our ref: detect when Open77 releases it */
     HANDLE dup;
     ID3D11Texture2D* tex11;
     ID3D11ShaderResourceView* srv;
@@ -67,8 +68,8 @@ typedef struct {
     int used, dead;
     unsigned id;
     DWORD tid;
-    DWORD t_wall;                     /* ms dalla mezzanotte, per correlare con il log di Open77 */
-    char name[40];                    /* nome della superficie Open77, dal log di import */
+    DWORD t_wall;                     /* ms since midnight, matched against the Open77 log */
+    char name[40];                    /* Open77 surface name, from the import log line */
     double t_last;
     UINT w, h;
     DXGI_FORMAT fmt;
@@ -129,9 +130,9 @@ static int g_sample_ok = 1, g_sample_errors;
 static int g_fence_logs;
 static UINT g_act_w, g_act_h;
 
-/* Visibilita' nativa delle superfici, letta dal log di Open77: la schermata di
-   connessione (open77_shell) viene nascosta con "WebUI hide applied" senza essere
-   ridisegnata, quindi il suo ultimo frame resterebbe nel visore. */
+/* Native surface visibility, read from the Open77 log. The connection screen
+   (open77_shell) is hidden with "WebUI hide applied" and is not repainted, so
+   its last frame would otherwise stay in the headset. */
 #define VIS_MAX 16
 static struct { char name[40]; int hidden; } g_vis[VIS_MAX];
 static int g_vis_n;
@@ -155,12 +156,14 @@ static int32_t g_end_rel;
 static void* g_end_tail;
 static void* g_end_stub;
 static void* g_end_meta_tramp;
-static int g_end_mode;            /* 0=none 1=VD tail jmp 2=Meta prologue */
+static int g_end_mode;            /* 0 = none, 1 = VD tail jump, 2 = Meta prologue */
 static void* g_create_tramp;
 
-/* Prologo MSVC comune a ovr_EndFrame / ovr_CreateTextureSwapChainDX nella build
-   nativa Meta (LibOVRRTImpl64_1.dll): tre mov [rsp+x],reg = 15 byte, boundary a 15.
-   Position-independent, quindi rilocabile in un trampolino senza disassembler. */
+/* MSVC prologue shared by ovr_EndFrame and ovr_CreateTextureSwapChainDX in the
+   native Meta build (LibOVRRTImpl64_1.dll): three mov [rsp+x], reg instructions,
+   15 bytes, and the 15th byte is an instruction boundary. The bytes are
+   position-independent, so they can be relocated into a trampoline without a
+   disassembler. */
 static const unsigned char kMetaProlog[15] = {
     0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18
 };
@@ -200,7 +203,7 @@ static unsigned g_frames;
 static int g_fail_n, g_bridge_off, g_ok_logged, g_tint_logged, g_sess_fail_logged, g_open_logs, g_layout_logged;
 static DWORD g_last_create_try;
 
-/* ------------------------------------------------------------------ util */
+/* ------------------------------------------------------------------ utilities */
 
 static void hud_log(const char* fmt, ...) {
     FILE* f = _wfopen(g_log_path, L"a");
@@ -297,7 +300,7 @@ static void load_ini(void) {
     read_key(buf, "hideSurfaces", g_hide_list, sizeof(g_hide_list));
 }
 
-/* ---------------------------------------------------- ring Open77 (D3D12) */
+/* ------------------------------------------------- Open77 rings (D3D12) */
 
 static double now_ms(void) {
     static LARGE_INTEGER freq;
@@ -360,13 +363,13 @@ static void note_shared(void* obj, HANDLE handle) {
         ID3D12Resource_Release(res);
         return;
     }
-    /* Le superfici CEF di Open77 sono BGRA8 a un solo mip. Le swapchain OVR di
-       REAL VR (occhi e board) passano da qui come RGBA8 sRGB a 3 mip. */
+    /* Open77 CEF surfaces are single-mip BGRA8. R.E.A.L. eye and board
+       swapchains also pass through here, as 3-mip RGBA8 sRGB. */
     if (g_only_bgra && (!bgra(rd.Format) || rd.MipLevels != 1)) {
         static int skipped;
         if (skipped < 8) {
             skipped++;
-            hud_log("skip shared %ux%u fmt %u mips %u tid %u (non Open77)", (unsigned)rd.Width, rd.Height, (unsigned)rd.Format, (unsigned)rd.MipLevels, tid);
+            hud_log("skip shared %ux%u fmt %u mips %u tid %u (not an Open77 page)", (unsigned)rd.Width, rd.Height, (unsigned)rd.Format, (unsigned)rd.MipLevels, tid);
         }
         ID3D12Resource_Release(res);
         return;
@@ -551,10 +554,10 @@ static void patch_endframe(HMODULE lib) {
     DWORD old = 0;
     void* tail;
     if (!fn) { hud_log("ovr_EndFrame missing"); return; }
-    /* Build Meta nativa: prologo MSVC standard, aggancio in testa (prologue hook). */
+    /* Native Meta build: standard MSVC prologue, hooked at the function entry. */
     if (memcmp(fn, kMetaProlog, sizeof(kMetaProlog)) == 0) {
         void* tr;
-        if (fn[0] == 0xFF && fn[1] == 0x25) return;   /* gia' agganciato */
+        if (fn[0] == 0xFF && fn[1] == 0x25) return;   /* already hooked */
         tr = hook_prologue(fn, kMetaProlog, sizeof(kMetaProlog), (void*)Hook_EndFrame_Meta);
         if (tr) {
             g_end_meta_tramp = tr;
@@ -563,8 +566,8 @@ static void patch_endframe(HMODULE lib) {
         } else hud_log("endframe meta prologue hook failed");
         return;
     }
-    /* Build Virtual Desktop: la EndFrame pubblica termina con un jmp (E9) a +38
-       verso l'implementazione interna; ridirigiamo quel jmp (tail patch). */
+    /* Virtual Desktop build: the public EndFrame ends with a jmp (E9) at +38
+       into the internal implementation. Redirect that jump. */
     jmp = fn + 38;
     if (jmp[0] != 0xE9) {
         hud_log("endframe shape unexpected %02X %02X %02X ... @38 %02X (bridge off)", fn[0], fn[1], fn[2], jmp[0]);
@@ -762,7 +765,7 @@ static int init_d3d11(ID3D11Device* dev) {
     int i;
     if (g_dev == dev && g_vs && g_ps && g_ps_lin && g_bs) return 1;
     release_d3d11();
-    /* slot gia' aperti e risorse di campionamento appartengono a un altro device */
+    /* Slots already opened, and the sampling resources, belong to another device. */
     EnterCriticalSection(&g_lock);
     release_sampling();
     for (i = 0; i < RING_MAX; i++) {
@@ -969,10 +972,11 @@ static int ring_ready(const Ring* r) {
     return 1;
 }
 
-/* ------------------------------------------- scelta dello slot corrente */
-/* Firma di contenuto di ogni slot: copia in una texture con mip, GenerateMips,
-   lettura di un mip ~40x40 (ogni texel media ~30x30 px: basta un numero che cambia).
-   Lettura con DO_NOT_WAIT qualche frame dopo, cosi' non si ferma mai la GPU. */
+/* ------------------------------------------- current-slot selection */
+/* Content signature of each slot: copy into a mip texture, GenerateMips, then
+   read a mip of about 40x40 (each texel averages ~30x30 pixels; only a value
+   that changes is needed). The read uses DO_NOT_WAIT a few frames later, so
+   the GPU is never stalled. */
 
 #ifndef DXGI_ERROR_WAS_STILL_DRAWING
 #define DXGI_ERROR_WAS_STILL_DRAWING ((HRESULT)0x887A000AL)
@@ -1075,13 +1079,13 @@ static void eval_pass_locked(Ring* r) {
     }
     r->passes++;
     if (first) {
-        /* primo campione: nessuna storia, prendiamo lo slot con piu' contenuto */
+        /* First sample: no history yet, so take the slot with the most content. */
         best = 0;
         for (k = 1; k < r->n; k++) if (r->s[k].alpha >= r->s[best].alpha) best = k;
         if (r->newest < 0) r->newest = best;
     } else if (changed) {
-        /* lo slot cambiato e' quello appena scritto; se ne sono cambiati piu' d'uno
-           nello stesso passaggio vince l'ultimo nell'ordine di rotazione del ring */
+        /* A changed slot is the one just written. If several changed in the same
+           pass, the last one in ring-rotation order wins. */
         r->last_change = GetTickCount();
         prev = r->newest < 0 ? 0 : r->newest;
         best = -1;
@@ -1182,8 +1186,8 @@ static void issue_passes_locked(void) {
     }
 }
 
-/* Open77 rilascia i ring delle superfici distrutte o ridimensionate: quando resta
-   solo il nostro riferimento, il ring non e' piu' mostrato da nessuno. */
+/* Open77 releases the rings of surfaces it destroys or resizes. When only our
+   reference remains, nobody is displaying that ring anymore. */
 static void check_released_locked(void) {
     int i, k;
     for (i = 0; i < RING_MAX; i++) {
@@ -1258,9 +1262,10 @@ static void set_vis(const char* name, int hidden) {
     if (prev != hidden) hud_log("surface [%s] %s by Open77", name, hidden ? "hidden" : "shown");
 }
 
-/* La riga di import del log ("[ tid] ... surface N [nome] ... ring revision R imported")
-   e' scritta dallo stesso thread che ha aperto gli handle, dopo il terzo slot: un thread
-   importa i ring uno alla volta, quindi il nome va al ring piu' vecchio ancora senza nome. */
+/* The import log line ("[ tid] ... surface N [name] ... ring revision R imported")
+   is written by the same thread that opened the handles, after the third slot.
+   One thread imports rings one at a time, so the name goes to the oldest ring
+   that does not have a name yet. */
 static void name_ring(const char* name, DWORD tid, DWORD ms) {
     int i, best = -1;
     DWORD dt = 0;
@@ -1326,7 +1331,7 @@ static void restore_state(Saved* s) {
     if (s->dss) ID3D11DepthStencilState_Release(s->dss);
 }
 
-/* Disegna le pagine nel buffer corrente della nostra chain e fa il commit. */
+/* Draw the pages into the current swapchain buffer and commit it. */
 static int render_hud(const int* board_vp) {
     Saved s;
     D3D11_VIEWPORT vp;
@@ -1401,7 +1406,7 @@ static int render_hud(const int* board_vp) {
     }
     if (tint && !g_tint_logged) {
         g_tint_logged = 1;
-        hud_log("tint test active (no Open77 pages yet): nel visore la board deve apparire azzurra");
+        hud_log("tint test active (no Open77 pages yet): the headset board should look light blue");
     }
     if ((g_frames % 600) == 0)
         hud_log("hud frame %u: %d rings ready, %d slots drawn (%s), %ux%u", g_frames, avail, drawn,
@@ -1547,8 +1552,8 @@ static int __cdecl Hook_EndTail(void* internal, void* session, uint64_t frameInd
     return rc;
 }
 
-/* Variante per la build nativa Meta: hook sul prologo della ovr_EndFrame pubblica.
-   Firma pubblica Win64: (session, frameIndex, viewScaleDesc, layerPtrList, layerCount). */
+/* Native Meta build: hook on the prologue of the public ovr_EndFrame.
+   Win64 signature: (session, frameIndex, viewScaleDesc, layerPtrList, layerCount). */
 static int __cdecl Hook_EndFrame_Meta(void* session, uint64_t frameIndex, void* vsd, void** layers, unsigned count) {
     typedef int(__cdecl* Fn)(void*, uint64_t, void*, void**, unsigned);
     Fn orig = (Fn)g_end_meta_tramp;
@@ -1576,7 +1581,7 @@ static int __cdecl Hook_EndFrame_Meta(void* session, uint64_t frameIndex, void* 
     return rc;
 }
 
-/* ------------------------------------------------ lettura log di Open77 */
+/* ---------------------------------------------------- Open77 log tail */
 
 static void process_log_line(const char* line) {
     const char* p;

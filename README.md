@@ -63,11 +63,21 @@ First public release of the Open77 VR HUD bridge.
 ## About
 
 It was a necessity for me to have something like that implemented in Open//77 as I really enjoy experiencing the game in VR.
+
 The game may not be playable 100% but if a server is built as a social VR experience like VRChat worlds, I think it has a lot of potential.
-The whole project is vibe-coded with Grok 4.7 and Claude Fable 5.1 using Cursor without prior programming knowledge, I've been working on it iteration by iteration for 50+ hours.
+
+The whole project is vibe-coded with Grok 4.7 and Claude Fable 5.1 using Cursor without prior programming knowledge. 
+
+I've been working on it iteration by iteration for 50+ hours.
+
+It has some bugs and things to fix, I never wanted it to be FINAL because AI made it, not me.
+
 The whole idea behind this project is to place the first building block.
+
 I would REALLY love to see it implemented by someone that has the same ambition as me but with enough knowledge to make it better and optimize it for everyone.
+
 I REALLY believe that Open//77 is going to grow as much as FiveM... but FiveM doesn't have VR servers ;)
+
 
 ##It's a niche, but a cool niche.
 

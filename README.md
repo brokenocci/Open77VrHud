@@ -1,4 +1,4 @@
-# Open77 VR HUD
+# Open77 VR HUD (deprecated)
 
 RED4ext plugin that draws the Open77 WebUI into the headset while playing Cyberpunk 2077 with R.E.A.L. VR, Virtual Desktop (wireless, cabled mode not tested) or Oculus/Meta Link.
 
